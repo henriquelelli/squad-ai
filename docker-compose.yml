@@ -1,0 +1,206 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # INFRAESTRUTURA BASE
+  # ==========================================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: artico-redis
+    networks:
+      - agents-backend
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: artico-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-artico}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-artico_secret}
+      POSTGRES_DB: ${DB_NAME:-audit_trail}
+    networks:
+      - agents-backend
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-artico}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # AGENTE PMO - ORQUESTRADOR PRINCIPAL
+  # Com Kimi Code CLI + MCP servers
+  # ==========================================
+  
+  kimi-orchestrator:
+    build:
+      context: ./infrastructure/kimi-orchestrator
+      dockerfile: Dockerfile
+    container_name: artico-pmo
+    environment:
+      - SYSTEM_PROMPT_PATH=/workspace/prompts/pmo-techlead.md
+      - AGENT_ARCHETYPE=techlead-coder-senior  # Define o padrão comportamental
+
+      - KIMI_API_KEY=${KIMI_API_KEY}
+      - KIMI_MODEL=${KIMI_MODEL:-kimi-k2.5}
+      - AGENT_ROLE=PMO
+      - DB_HOST=postgres
+      - DB_USER=${DB_USER:-artico}
+      - DB_PASSWORD=${DB_PASSWORD:-artico_secret}
+      - REDIS_HOST=redis
+    networks:
+      - agents-backend
+      - external-access  # Único com acesso externo (para buscar docs)
+    volumes:
+      - ./prompts:/workspace/prompts:ro
+      - ./volumes/source-code:/workspace/code:rw
+      - ./volumes/kimi-config:/root/.kimi:rw
+      - ./volumes/audit-logs:/workspace/logs:rw
+      - /var/run/docker.sock:/var/run/docker.sock  # Para orquestrar outros containers
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    # Limites para não estourar custo acidentalmente
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  # ==========================================
+  # AGENTE TDD - ESCRITOR DE TESTES
+  # Ambiente isolado, apenas framework de testes
+  # ==========================================
+  
+  agent-tdd:
+    build:
+      context: ./infrastructure/agent-tdd
+      dockerfile: Dockerfile
+    container_name: artico-tdd
+    environment:
+      - KIMI_API_KEY=${KIMI_API_KEY}
+      - AGENT_ROLE=TDD_WRITER
+      - TEST_FRAMEWORK=pytest
+      - COVERAGE_THRESHOLD=80
+    networks:
+      - agents-backend
+    volumes:
+      - ./volumes/source-code:/workspace/code:rw
+      - ./volumes/audit-logs:/workspace/logs:rw
+      - tdd-temp:/tmp
+    working_dir: /workspace
+    # Sem acesso à internet (aporte isolado)
+    # Regra de firewall implícita: só fala com backend
+    profiles:
+      - agents
+    restart: "no"  # Roda on-demand pelo PMO
+
+  # ==========================================
+  # AGENTE DEV - IMPLEMENTADOR
+  # Isolamento máximo, sem acesso externo
+  # ==========================================
+  
+  agent-dev:
+    build:
+      context: ./infrastructure/agent-dev-senior
+      dockerfile: Dockerfile
+    container_name: artico-dev
+    environment:
+      - KIMI_API_KEY=${KIMI_API_KEY}
+      - AGENT_ROLE=DEVELOPER
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    networks:
+      - agents-backend
+    volumes:
+      - ./volumes/source-code:/workspace/code:rw
+      - ./volumes/audit-logs:/workspace/logs:rw
+      - dev-cache:/root/.cache
+    working_dir: /workspace
+    # Security: sem capacidades de rede externa
+    sysctls:
+      - net.ipv4.conf.all.route_localnet=0
+    profiles:
+      - agents
+    restart: "no"
+
+  # ==========================================
+  # AGENTE QA - REVISOR DE QUALIDADE
+  # Ferramentas de análise estática e segurança
+  # ==========================================
+  
+  agent-qa:
+    build:
+      context: ./infrastructure/agent-qa
+      dockerfile: Dockerfile
+    container_name: artico-qa
+    environment:
+      - KIMI_API_KEY=${KIMI_API_KEY}
+      - AGENT_ROLE=QA_REVIEWER
+      - SAST_RULES_PATH=/opt/rules
+    networks:
+      - agents-backend
+    volumes:
+      - ./volumes/source-code:/workspace/code:ro  # Read-only!
+      - ./volumes/audit-logs:/workspace/logs:rw
+      - ./infrastructure/agent-qa/rules:/opt/rules:ro
+    working_dir: /workspace
+    profiles:
+      - agents
+    restart: "no"
+
+  # ==========================================
+  # MCP SERVERS (Model Context Protocol)
+  # Serviços de integração externos
+  # ==========================================
+  
+  mcp-filesystem:
+    image: mcp/filesystem:latest
+    container_name: artico-mcp-fs
+    networks:
+      - agents-backend
+    volumes:
+      - ./volumes/source-code:/filesystem:ro
+    environment:
+      - MCP_ALLOWED_DIRS=/filesystem
+    profiles:
+      - mcp
+
+  mcp-git:
+    image: mcp/git:latest
+    container_name: artico-mcp-git
+    networks:
+      - agents-backend
+    volumes:
+      - ./volumes/source-code:/repos:rw
+      - ./volumes/git-config:/root/.gitconfig:ro
+    profiles:
+      - mcp
+
+networks:
+  agents-backend:
+    driver: bridge
+    internal: true  # Isolado da internet externa
+  
+  external-access:
+    driver: bridge
+    # Permitir acesso externo apenas para PMO buscar documentação
+
+volumes:
+  postgres-data:
+  redis-data:
+  tdd-temp:
+  dev-cache:
